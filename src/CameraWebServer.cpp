@@ -17,15 +17,17 @@
 #include <LittleFS.h>
 #include <FS.h>
 #include "time.h"
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+
+
+
 struct tm timeinfo;
 const char* ntpServer = "pool.ntp.org";
 const char* TZ_INFO    = "GMT+0BST-1,M3.5.0/01:00:00,M10.5.0/02:00:00";  // enter your time zone (https://remotemonitoringsystems.ca/time-zone-abbreviations.php)
 long unsigned lastNTPtime;
 time_t now;
 
-#include <Firebase_ESP_Client.h>
-//Provide the token generation process info.
-#include <addons/TokenHelper.h>
 
 //Replace with your network credentials
 const char* ssid = "23-Oak-Crescent";
@@ -72,7 +74,7 @@ String localTime() {
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
-
+#define N 5
 boolean takeNewPhoto = false;
 
 //Define Firebase Data objects
@@ -82,50 +84,33 @@ FirebaseConfig configF;
 
 void fcsUploadCallback(FCS_UploadStatusInfo info);
 
-bool taskCompleted = false;
+int taskCompleted = 1;
+
+camera_fb_t* fb_array[N];
+int fb_index = 0, loopCount = 0;
 
 // Capture Photo and Save it to LittleFS
 void capturePhotoSaveLittleFS( void ) {
   // Dispose first pictures because of bad quality
-  camera_fb_t* fb = NULL;
+  
   // Skip first 3 frames (increase/decrease number as needed).
-  for (int i = 0; i < 4; i++) {
-    fb = esp_camera_fb_get();
-    esp_camera_fb_return(fb);
-    fb = NULL;
-  }
-    
+  
+  esp_camera_fb_return(fb_array[fb_index]);
+  
+  
   // Take a new photo
-  fb = NULL;  
-  digitalWrite(4, HIGH);
-  delay(500);
-  fb = esp_camera_fb_get();  
-  digitalWrite(4, LOW);
-  if(!fb) {
+  fb_array[fb_index] = NULL;  
+  
+  fb_array[fb_index] = esp_camera_fb_get();  
+  
+  if(!fb_array[fb_index]) {
     Serial.println("Camera capture failed");
-    delay(1000);
-    ESP.restart();
-  }  
+  } 
 
-  // Photo file name
-  Serial.printf("Picture file name: %s\n", FILE_PHOTO_PATH);
-  File file = LittleFS.open(FILE_PHOTO_PATH, FILE_WRITE);
-
-  // Insert the data in the photo file
-  if (!file) {
-    Serial.println("Failed to open file in writing mode");
-  }
-  else {
-    file.write(fb->buf, fb->len); // payload (image), payload length
-    Serial.print("The picture has been saved in ");
-    Serial.print(FILE_PHOTO_PATH);
-    Serial.print(" - Size: ");
-    Serial.print(fb->len);
-    Serial.println(" bytes");
-  }
-  // Close the file
-  file.close();
-  esp_camera_fb_return(fb);
+  // Change the index
+  fb_index++;
+  if(fb_index >= N ) fb_index = 0;
+  
 }
 
 void initWiFi(){
@@ -175,7 +160,7 @@ void initCamera(){
   if (psramFound()) {
     config.frame_size = FRAMESIZE_UXGA;
     config.jpeg_quality = 10;
-    config.fb_count = 1;
+    config.fb_count = N;
   } else {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
@@ -219,6 +204,17 @@ bool getNTPtime(int sec) {
 
 
 void setup() {
+
+  
+  for (int i = 0; i < N; i++) {
+      fb_array[i] = (camera_fb_t*)malloc(sizeof(camera_fb_t));
+      if (fb_array[i] == NULL) {
+          // Handle allocation failure
+      }
+      // Initialize fb_array[i] as needed
+  }
+
+
   // Serial port for debugging purposes
   Serial.begin(115200);
   initWiFi();
@@ -256,34 +252,41 @@ void setup() {
 
 void loop() {
   
-  if (takeNewPhoto) {
+  if (loopCount >= 10) {
     capturePhotoSaveLittleFS();
-    taskCompleted = false;
-    takeNewPhoto = false;
+    loopCount = 0;
   }
   delay(1);
-  if (Firebase.ready() && !taskCompleted){
-    taskCompleted = true;
+  if (Firebase.ready() && taskCompleted == 0){
+    taskCompleted = 1;
+    for(int i = 0; i < N; i++){
+    if(fb_array[i] != NULL){
     Serial.print("Uploading picture... ");
 
     //MIME type should be valid to avoid the download problem.
     //The file systems for flash and SD/SDMMC can be changed in FirebaseFS.h.
     for (int i = 0; i < 4; i++){
       Serial.printf("\nDownload URL: %s\n", fbdo.downloadURL().c_str());
-      if (Firebase.Storage.upload(&fbdo, 
+      if(Firebase.Storage.upload(&fbdo, 
         STORAGE_BUCKET_ID /* Firebase Storage bucket id */, 
-        FILE_PHOTO_PATH/* path to local file */, 
-        mem_storage_type_flash /* memory storage type, mem_storage_type_flash and mem_storage_type_sd */,  
+        fb_array[i]->buf /* byte array from ram or flash */, 
+        fb_array[i]->len /*  size of data in bytes */, 
         BUCKET_PHOTO + localTime() + ".jpg" /* path of remote file stored in the bucket */, 
-        "image/jpeg" /* mime type */,
-        fcsUploadCallback
-        )) break;
-      delay(4000);
+        "image/jpeg" /* mime type */, 
+        fcsUploadCallback /* callback function */)) break;
+      esp_camera_fb_return(fb_array[i]);
     }
-    
+    } else {
+      Serial.println("NULL buffer");
+    }
+    }
   }
-  if (digitalRead(14)) takeNewPhoto = true;
+
+  //Capture two more images after the trigger
+  if (digitalRead(14)) taskCompleted = -2;
+  if (taskCompleted < 0) taskCompleted++;
   delay(100);
+  loopCount++;
 }
 
 // The Firebase Storage upload callback function
